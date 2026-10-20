@@ -1,122 +1,74 @@
-import { isCancel } from 'axios';
-import { makeAutoObservable } from 'mobx';
+import type {
+    DefaultError,
+    QueryClient,
+    QueryKey,
+    QueryObserverOptions,
+    QueryObserverResult,
+} from '@tanstack/query-core';
 
-import { RemoteData } from './data';
-import { normalizeError } from './error';
+import { QueryObserver } from '@tanstack/query-core';
+import { makeAutoObservable, when } from 'mobx';
 
-export interface RemoteLoadable<T, Args extends unknown[] = []> {
-    state: RemoteData<T>;
-    data?: T;
-
-    load(...args: Args): Promise<T | undefined>;
-    cancel(): void;
-    reset(): void;
+export interface RemoteLoader<TData, TError = DefaultError> {
+    result: QueryObserverResult<TData, TError>;
+    ensureFetched(): Promise<void>;
 }
 
-interface RemoteLoaderOptions {
-    alwaysReload?: boolean;
-}
+export class RemoteLoaderImpl<
+    TQueryFnData = unknown,
+    TError = DefaultError,
+    TData = TQueryFnData,
+    TQueryData = TQueryFnData,
+    TQueryKey extends QueryKey = QueryKey,
+> implements RemoteLoader<TData, TError> {
+    result: QueryObserverResult<TData, TError>;
 
-const defaultRemoteLoaderOptions = {
-    alwaysReload: false,
-};
-
-export class RemoteLoader<T, Args extends unknown[] = []> implements RemoteLoadable<T, Args> {
-    state: RemoteData<T> = { kind: 'none' };
-
-    promise: Promise<T | undefined> | null = null;
-    abortController = new AbortController();
-
-    options: RemoteLoaderOptions;
+    observer: QueryObserver<TQueryFnData, TError, TData, TQueryData, TQueryKey>;
 
     constructor(
-        public request: (signal: AbortSignal, ...args: Args) => Promise<T>,
-        public onError?: (error: Error) => void,
-        options?: Partial<RemoteLoaderOptions>,
+        private readonly client: QueryClient,
+        private options: QueryObserverOptions<TQueryFnData, TError, TData, TQueryData, TQueryKey>,
     ) {
-        this.options = {
-            ...defaultRemoteLoaderOptions,
-            ...options,
-        };
+        makeAutoObservable(this, {
+            observer: false,
+        });
 
-        makeAutoObservable(this);
+        const defaultedOptions = client.defaultQueryOptions(options);
+
+        this.observer = new QueryObserver(client, defaultedOptions);
+        this.result = this.observer.getOptimisticResult(defaultedOptions);
     }
 
-    async load(...args: Args): Promise<T | undefined> {
-        if (!this.options.alwaysReload && this.state.kind === 'fetched') {
-            return this.state.data;
-        }
+    subscribe() {
+        const unsubscribe = this.observer.subscribe((nextResult) => {
+            this.setResult(nextResult);
+        });
 
-        if (!this.options.alwaysReload && this.promise) {
-            return this.promise;
-        }
-
-        this.abortController.abort();
-        this.abortController = new AbortController();
-
-        if (this.state.kind === 'fetched' || this.state.kind === 'refetching') {
-            this.setState({
-                kind: 'refetching',
-                data: this.state.data,
-            });
-        } else {
-            this.setState({ kind: 'fetching' });
-        }
-
-        this.promise = this.execute(...args);
-
-        return this.promise;
+        return unsubscribe;
     }
 
-    get data(): T | undefined {
-        if (this.state.kind === 'fetched' || this.state.kind === 'refetching') {
-            return this.state.data;
-        }
-
-        return undefined;
-    }
-
-    async execute(...args: Args): Promise<T | undefined> {
+    async ensureFetched(): Promise<void> {
+        const unsubscribe = this.subscribe();
         try {
-            const data = await this.request(this.abortController.signal, ...args);
-
-            this.setState({ kind: 'fetched', data });
-
-            return data;
-        } catch (error: unknown) {
-            const normalizedError = normalizeError(error);
-
-            if (isCancel(normalizedError)) {
-                this.setState({
-                    kind: 'canceled',
-                    error: normalizedError,
-                });
-            } else {
-                this.setState({
-                    kind: 'error',
-                    error: normalizedError,
-                });
-
-                this.onError?.(normalizedError);
-            }
-
-            return undefined;
+            await when(() => this.result.isSuccess || this.result.isError, {
+                timeout: 30_000,
+            });
         } finally {
-            this.promise = null;
+            unsubscribe();
         }
     }
 
-    cancel() {
-        this.abortController.abort();
+    setResult(result: QueryObserverResult<TData, TError>) {
+        this.result = result;
     }
 
-    reset() {
-        this.abortController.abort();
-        this.promise = null;
-        this.setState({ kind: 'none' });
-    }
+    setOptions(options: typeof this.options) {
+        this.options = options;
 
-    setState(state: RemoteData<T>) {
-        this.state = state;
+        const defaultedOptions = this.client.defaultQueryOptions(options);
+
+        this.observer.setOptions(defaultedOptions);
+
+        this.setResult(this.observer.getOptimisticResult(defaultedOptions));
     }
 }
